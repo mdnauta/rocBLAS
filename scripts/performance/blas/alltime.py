@@ -1,237 +1,175 @@
-#!/usr/bin/python3
-
-import sys, getopt
-sys.path.append('../../../clients/common/')
-import numpy as np
-from math import *
-import subprocess
+#!/usr/bin/env python3
+import argparse
+from collections import OrderedDict
+import sys
 import os
-import re # regexp package
-import shutil
-import tempfile
+
+sys.path.append('../../../clients/common/')
 import rocblas_gentest as gt
-import getspecs
 
-usage = '''A timing script for rocBLAS the generates plots
+import commandrunner as cr
 
-Usage:
+# These are required to translate YAML into arguments to timing.py
+def do_nothing(input_str):
+    return input_str
+def equal_to_one(input_str):
+    return input_str == 1
 
-\talltime.py
-\t\t-A          working directory A
-\t\t-B          working directory B (optional)
-\t\t-i          input yaml
-\t\t-o          output directory
-\t\t-b          output directory for the base run
-\t\t-T          do not perform BLAS functions; just generate document
-\t\t-f          document format: pdf (default) or docx (Need forked docx plugin)
-\t\t-d          device number (default: 0)
-\t\t-g          generate graphs via Asymptote: 0(default) or 1
-\t\t-S          plot speedup (default: 1, disabled: 0)
-'''
+USED_YAML_KEYS_FMT = {
+        'n':              do_nothing,
+        'N':              do_nothing,
+        'm':              do_nothing,
+        'M':              do_nothing,
+        'k':              do_nothing,
+        'K':              do_nothing,
+        'batch_count':    do_nothing,
+        'function':       do_nothing,
+        'compute_type':   do_nothing,
+        'incx':           do_nothing,
+        'incy':           do_nothing,
+        'alpha':          do_nothing,
+        'beta':           do_nothing,
+        'iters':          do_nothing,
+        'samples':        do_nothing,
+        'lda':            do_nothing,
+        'ldb':            do_nothing,
+        'ldc':            do_nothing,
+        'LDA':            do_nothing,
+        'LDB':            do_nothing,
+        'LDC':            do_nothing,
+        'transA':         do_nothing,
+        'transB':         do_nothing,
+        #'initialization': do_nothing, # Unused?
+        'step_size':      do_nothing,
+        'step_mult':      equal_to_one, # There always has to be one exception...
+        'side':           do_nothing,
+        'uplo':           do_nothing,
+        'diag':           do_nothing,
+}
 
-# \t\t-t          data type: gflops #Maybe use option to plot time graphs too
+# If an argument is not relevant to a function, then its value is set to '*'.
+# We cannot pass a '*' to subsequent commands because it will, so that flag
+# needs to be removed.
+class StripStarsArgument(cr.ArgumentABC):
+    def __init__(self, flag):
+        cr.ArgumentABC.__init__(self)
+        self.flag = flag
+
+    def get_args(self):
+        if self._value is None:
+            raise RuntimeError('No value set for {}'.format(self.flag))
+        if self._value == '*': # If an asterisk is specified
+            return [] # Just ignore the flag entirely
+        return [self.flag, str(self._value)]
+
+class RocBlasArgumentSet(cr.ArgumentSetABC):
+    def _define_consistent_arguments(self):
+        self.consistent_args['n'             ] = StripStarsArgument('-n'             )
+        self.consistent_args['N'             ] = StripStarsArgument('-N'             )
+        self.consistent_args['m'             ] = StripStarsArgument('-m'             )
+        self.consistent_args['M'             ] = StripStarsArgument('-M'             )
+        self.consistent_args['k'             ] = StripStarsArgument('-k'             )
+        self.consistent_args['K'             ] = StripStarsArgument('-K'             )
+        self.consistent_args['batch_count'   ] = StripStarsArgument('-b'             ) #
+        self.consistent_args['function'      ] = StripStarsArgument('-f'             ) #
+        self.consistent_args['compute_type'  ] = StripStarsArgument('-p'             ) # precision
+        self.consistent_args['incx'          ] = StripStarsArgument('--incx'         )
+        self.consistent_args['incy'          ] = StripStarsArgument('--incy'         )
+        self.consistent_args['alpha'         ] = StripStarsArgument('--alpha'        )
+        self.consistent_args['beta'          ] = StripStarsArgument('--beta'         )
+        self.consistent_args['iters'         ] = StripStarsArgument('-i'             ) #
+        self.consistent_args['samples'       ] = StripStarsArgument('-a'             )
+        self.consistent_args['lda'           ] = StripStarsArgument('--lda'          )
+        self.consistent_args['ldb'           ] = StripStarsArgument('--ldb'          )
+        self.consistent_args['ldc'           ] = StripStarsArgument('--ldc'          )
+        self.consistent_args['LDA'           ] = StripStarsArgument('--LDA'          )
+        self.consistent_args['LDB'           ] = StripStarsArgument('--LDB'          )
+        self.consistent_args['LDC'           ] = StripStarsArgument('--LDC'          )
+        self.consistent_args['transA'        ] = StripStarsArgument('--transA'       )
+        self.consistent_args['transB'        ] = StripStarsArgument('--transB'       )
+        #self.consistent_args['initialization'] = StripStarsArgument('-initialization') # Unused?
+        self.consistent_args['step_size'     ] = StripStarsArgument('-s'             )
+        self.consistent_args['step_mult'     ] = cr.OptionalFlagArgument('-x'         ) # optional flag argument
+        self.consistent_args['side'          ] = StripStarsArgument('--side'         )
+        self.consistent_args['uplo'          ] = StripStarsArgument('--uplo'         )
+        self.consistent_args['diag'          ] = StripStarsArgument('--diag'         )
+
+    def _define_variable_arguments(self):
+        #self.variable_args['nsample'] = cr.RequiredArgument('-i')
+        self.variable_args['idir'] = cr.RequiredArgument('-w')
+        self.variable_args['output_file'] = cr.RequiredArgument('-o')
+
+    def __init__(self, **kwargs):
+        cr.ArgumentSetABC.__init__(
+                self, **kwargs
+                )
+
+    def get_full_command(self, run_configuration):
+        timingscript = './timing.py'
+        if not os.path.exists(timingscript):
+            timingscript = os.path.join(os.path.dirname(os.path.realpath(__file__)), timingscript)
+        else:
+            timingscript = os.path.abspath(timingscript)
+        if not os.path.exists(timingscript):
+            raise RuntimeError('Unable to find {}!'.format(timingscript))
+
+        #self.set('nsample', run_configuration.num_runs)
+        self.set('idir', run_configuration.executable_directory)
+        self.set('output_file', self.get_output_file(run_configuration))
+
+        return [timingscript] + self.get_args()
+
+    def collect_timing(self, run_configuration, data_type='time'):
+        output_filename = self.get_output_file(run_configuration)
+        rv = {}
+        print('Processing {}'.format(output_filename))
+        if os.path.exists(output_filename):
+            # The output format is not consistent enough to justify using an out of the box reader.
+            with open(output_filename, 'r') as raw_tsv:
+                for line in raw_tsv.readlines():
+                    # remove comment by splittling on `#` and taking the first segment
+                    stripped_line = line.split('#')[0].strip()
+                    if stripped_line:
+                        split_line = stripped_line.split()
+                        tag = int(split_line[0])
+                        # Each line has 3 sections of num_samples, followed by the samples
+                        samples = {}
+                        read_idx = 1
+                        for sample_type in ['time', 'gflops', 'bandwidth']:
+                            num_samples = int(split_line[read_idx])
+                            read_idx += 1
+                            samples[sample_type] = [float(x) for x in split_line[read_idx:num_samples+read_idx]]
+                            read_idx += num_samples
+                        rv[tag] = samples[data_type]
+        else:
+            print('{} does not exist'.format(output_filename))
+        return rv
 
 
-def nextpow(val, radix):
-    x = 1
-    while(x <= val):
-        x *= radix
-    return x
+class YamlData:
 
-class rundata:
+    def __init__(self, config_file):
+        self.config_file = config_file
+        self.test_cases = []
+        self.execute_run()
 
-    def __init__(self, wdir, odir, diridx, label,
-                 data, hwinfo):
-        self.wdir = wdir
-        self.odir = odir
-        self.diridx = diridx
-        self.minnsize = data['n']
-        self.maxNsize = data['N']
-        self.minmsize = data['m']
-        self.maxMsize = data['M']
-        self.minksize = data['k']
-        self.maxKsize = data['K']
-        self.nbatch = data['batch_count']
-        self.function = data['function']
-        self.precision = data['compute_type']    #This picks precision
-        self.label = label
-        self.incx = data['incx']
-        self.incy = data['incy']
-        self.alpha = data['alpha']
-        self.beta = data['beta']
-        self.iters = data['iters']
-        self.samples = data['samples']
-        self.lda = data['lda']
-        self.ldb = data['ldb']
-        self.ldc = data['ldc']
-        self.LDA = data['LDA']
-        self.LDB = data['LDB']
-        self.LDC = data['LDC']
-        self.transA = data['transA']
-        self.transB = data['transB']
-        self.initialization = data['initialization']
-        self.step_size = data['step_size']
-        self.step_mult = data['step_mult']
-        self.side = data['side']
-        self.uplo = data['uplo']
-        self.diag = data['diag']
-        self.theoMax = -1
-
-
-        flopseq = data['flops']
-        memeq = data['mem']
-        precisionBits = int(re.search(r'\d+', self.precision).group())
-        if(self.function == 'trsm' or self.function == 'gemm'):  #TODO better logic to decide memory bound vs compute bound
-            self.theoMax = hwinfo['theoMaxCompute'] * 32.00 / precisionBits #scaling to appropriate precision
-        elif flopseq and memeq:                                  # Memory bound
-            try:
-                n=100000
-                flops = eval(flopseq)
-                mem = eval(memeq)
-                self.theoMax = hwinfo['Bandwidth'] / float(eval(memeq)) * eval (flopseq) * 32 / precisionBits / 4   #4 bytes scaled to type
-            except:
-                print("flops and mem equations produce errors")
-
-
-    def outfilename(self):
-        outfile = str(self.function)
-        outfile += "_" + self.precision
-        outfile += "_" + self.label.replace(' ', '_').replace('/', '_')
-        outfile += ".dat"
-        outfile = os.path.join(self.odir, outfile)
-        return outfile
-
-    def runcmd(self, nsample):
-        cmd = ["./timing.py"]
-
-        cmd.append("-w")
-        cmd.append(self.wdir)
-
-        cmd.append("-i")
-        cmd.append(str(self.iters))
-
-        cmd.append("-a")
-        cmd.append(str(self.samples))
-
-        cmd.append("-b")
-        cmd.append(str(self.nbatch))
-
-        cmd.append("-m")
-        cmd.append(str(self.minmsize))
-        cmd.append("-M")
-        cmd.append(str(self.maxMsize))
-
-        cmd.append("-n")
-        cmd.append(str(self.minnsize))
-        cmd.append("-N")
-        cmd.append(str(self.maxNsize))
-
-        cmd.append("-k")
-        cmd.append(str(self.minksize))
-        cmd.append("-K")
-        cmd.append(str(self.maxKsize))
-
-        cmd.append("-f")
-        cmd.append(self.function)
-
-        cmd.append("-p")
-        cmd.append(self.precision)
-
-        cmd.append("--lda")
-        cmd.append(str(self.lda))
-
-        cmd.append("--LDA")
-        cmd.append(str(self.LDA))
-
-        cmd.append("--ldb")
-        cmd.append(str(self.ldb))
-
-        cmd.append("--LDB")
-        cmd.append(str(self.LDB))
-
-        cmd.append("--ldc")
-        cmd.append(str(self.ldc))
-
-        cmd.append("--LDC")
-        cmd.append(str(self.LDC))
-
-        cmd.append("--incx")
-        cmd.append(str(self.incx))
-
-        cmd.append("--incy")
-        cmd.append(str(self.incy))
-
-        cmd.append("--alpha")
-        cmd.append(str(self.alpha))
-
-        cmd.append("--beta")
-        cmd.append(str(self.beta))
-
-        cmd.append("--transA")
-        cmd.append(str(self.transA))
-
-        cmd.append("--transB")
-        cmd.append(str(self.transB))
-
-        cmd.append("--side")
-        cmd.append(str(self.side))
-
-        cmd.append("--uplo")
-        cmd.append(str(self.uplo))
-
-        cmd.append("--diag")
-        cmd.append(str(self.diag))
-
-        cmd.append("-s")
-        cmd.append(str(self.step_size))
-
-        if self.step_mult == 1:
-            cmd.append("-x")
-
-        cmd.append("-o")
-        cmd.append(self.outfilename())
-
-        # cmd.append("-t")
-        # cmd.append("gflops")
-
-        return cmd
-
-    def executerun(self, nsample):
-        fout = tempfile.TemporaryFile(mode="w+")
-        ferr = tempfile.TemporaryFile(mode="w+")
-
-        proc = subprocess.Popen(self.runcmd(nsample), stdout=fout, stderr=ferr,
-                                env=os.environ.copy())
-        proc.wait()
-        rc = proc.returncode
-        if rc != 0:
-            print("****fail****")
-        return rc
-
-class yamldata:
-
-    def __init__(self, configFile):
-        self.configFile = configFile
-        self.testcases = []
-        self.executerun()
-
-    def reorderdata(self):
-        oldData = self.testcases
-        newData = []
+    def reorder_data(self):
+        old_data = self.test_cases
+        new_data = []
         names = []
-        for test in oldData:
+        for test in old_data:
             name = test['function']
             precision = test['compute_type']
             side = test['side']
-            if (name,precision) not in names:
-                type = [ x for x in oldData if x['function']==name and x['compute_type'] == precision and x['side'] == side ]
-                newData.append(type)
+            if (name,precision) not in names: # TODO: This will always be true because "side" is not in the tuple.
+                type = [ x for x in old_data if x['function']==name and x['compute_type'] == precision and x['side'] == side ]
+                new_data.append(type)
                 names.append((name,precision, side))
-        self.testcases = newData
+        self.test_cases = new_data
 
     #Monkey Patch
     def write_test(self, test):
-        self.testcases.append(test)
+        self.test_cases.append(test)
 
     #Monkey Patch
     def process_doc(self, doc):
@@ -260,8 +198,9 @@ class yamldata:
 
         # Defaults
         defaults = doc.get('Defaults') or {}
+        print(defaults)
 
-        default_add_ons = {"m": 1, "M": 1, "n": 1, "N": 1, "k": 1, "K": 1, "lda": 1, "ldb": 1, "ldc": 1, "LDA": 1, "LDB": 1, "LDC": 1, "iters": 1, "flops": '', "mem": '', "samples": 1, "step_mult": 0}
+        default_add_ons = {'m': 1, 'M': 1, 'n': 1, 'N': 1, 'k': 1, 'K': 1, 'lda': 1, 'ldb': 1, 'ldc': 1, 'LDA': 1, 'LDB': 1, 'LDC': 1, 'iters': 1, 'flops': '', 'mem': '', 'samples': 1, 'step_mult': 0}
         defaults.update(default_add_ons)
 
         # Known Bugs
@@ -276,506 +215,130 @@ class yamldata:
             case.update(test)
             gt.generate(case, gt.instantiate)
 
-    def importdata(self):
+    def import_data(self):
         gt.args['includes'] = []
-        gt.args['infile'] = self.configFile
+        gt.args['infile'] = self.config_file
         gt.write_test = self.write_test
         for doc in gt.get_yaml_docs():
             self.process_doc(doc)
-        # timeCases.extend(self.testcases)
-        # print(timeCases)
+
+    def execute_run(self):
+        self.import_data()
+        self.reorder_data()
+
+class RocBlasYamlComparison(cr.Comparison):
+    def __init__(self, data_type='time', **kwargs):
+        cr.Comparison.__init__(self, **kwargs)
+        self.data_type = data_type
+
+    def plot(self, run_configurations, axes):
+        label_map = OrderedDict()
+        xlengths_map = OrderedDict()
+        samples_map = OrderedDict()
+        # Combine equivalent run configurations
+        for run_configuration in run_configurations:
+            for argument_set in self.argument_sets:
+                key = run_configuration.get_id() + argument_set.get_hash()
+                xlengths = xlengths_map[key] if key in xlengths_map else []
+                samples = samples_map[key] if key in samples_map else []
+                timing = argument_set.collect_timing(run_configuration,
+                                                     data_type = self.data_type)
+                for xlength, subsamples in timing.items():
+                    for sample in subsamples:
+                        xlengths.append(xlength)
+                        samples.append(sample)
+                if len(samples) > 0:
+                    label_map[key] = run_configuration.label
+                    xlengths_map[key] = xlengths
+                    samples_map[key] = samples
+        for key in label_map:
+            axes.loglog(xlengths_map[key], samples_map[key], '.',
+                        label = label_map[key],
+                        markersize = 3,
+                        )
+        axes.set_xlabel('x-length (integer)')
+        if self.data_type == 'time':
+            axes.set_ylabel('Time (s)')
+        if self.data_type == 'gflops':
+            axes.set_ylabel('Speed (GFlops/s)')
+        if self.data_type == 'bandwidth':
+            axes.set_ylabel('Bandwidth (GB/s)')
+        return len(label_map) > 0
+
+data_type_classes = {}
+class TimeComparison(RocBlasYamlComparison):
+    def __init__(self, **kwargs):
+        RocBlasYamlComparison.__init__(self, data_type='time', **kwargs)
+data_type_classes['time'] = TimeComparison
+
+class FlopsComparison(RocBlasYamlComparison):
+    def __init__(self, **kwargs):
+        RocBlasYamlComparison.__init__(self, data_type='gflops', **kwargs)
+data_type_classes['gflops'] = FlopsComparison
+
+class BandwidthComparison(RocBlasYamlComparison):
+    def __init__(self, **kwargs):
+        RocBlasYamlComparison.__init__(self, data_type='bandwidth', **kwargs)
+data_type_classes['bandwidth'] = BandwidthComparison
 
 
-    def executerun(self):
-        self.importdata()
-        self.reorderdata()
+class RocFftRunConfiguration(cr.RunConfiguration):
+    def __init__(self, user_args, *args, **kwargs):
+        cr.RunConfiguration.__init__(self, user_args, *args, **kwargs)
 
 
-class getVersion:
-    def __init__(self, wdir):
-        self.wdir = wdir
-        self.prog = os.path.join(self.wdir, "rocblas-bench")
-        self.version = ""
-        self.executerun()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
 
-    def runcmd(self):
-        cmd = [self.prog]
+    parser.add_argument('-N', '--num-runs', default=10, type=int,
+                        help='Number of times to run each test.')
+    parser.add_argument('--data-types', default=data_type_classes.keys(), nargs='+',
+                        choices = data_type_classes.keys(),
+                        help='Types of data to generate plots for.')
+    parser.add_argument('-I', '--input-yaml', required=True,
+                        help='rocBLAS input yaml config.')
+    user_args = cr.parse_input_arguments(parser)
 
-        cmd.append("--version")
+    command_runner = cr.CommandRunner(user_args)
 
-        return cmd
-
-    def executerun(self):
-        fout = os.popen(" ".join(self.runcmd())).read()
-        #self.version = fout.split(":",1)[0] + ": " + fout.split("rel-",1)[1]
-        self.version = fout
-
-class figure:
-    def __init__(self, name, caption):
-        self.name = name
-        self.runs = []
-        self.caption = caption
-
-    def inputfiles(self):
-        files = []
-        for run in self.runs:
-            files.append(run.outfilename())
-        return files
-
-    def labels(self):
-        labels = []
-        for run in self.runs:
-            labels.append(run.label)
-        return labels
-
-    def filename(self, outdir, docformat):
-        outfigure = self.name
-        outfigure += ".pdf"
-        # if docformat == "pdf":
-        #     outfigure += ".pdf"
-        # if docformat == "docx":
-        #     outfigure += ".png"
-        return os.path.join(outdir, outfigure)
-
-
-    def asycmd(self, outdir, docformat, datatype, ncompare):
-        asycmd = ["asy"]
-
-        asycmd.append("-f")
-        asycmd.append("pdf")
-        # if docformat == "pdf":
-        #     asycmd.append("-f")
-        #     asycmd.append("pdf")
-        # if docformat == "docx":
-        #     asycmd.append("-f")
-        #     asycmd.append("png")
-        #     asycmd.append("-render")
-        #     asycmd.append("8")
-        asycmd.append("datagraphs.asy")
-
-        asycmd.append("-u")
-        asycmd.append('filenames="' + ",".join(self.inputfiles()) + '"')
-
-        asycmd.append("-u")
-        asycmd.append('legendlist="' + ",".join(self.labels()) + '"')
-
-        # if dirB != None and speedup: # disabled for now
-        #     asycmd.append("-u")
-        #     asycmd.append('speedup=true')
-        # else:
-        #     asycmd.append("-u")
-        #     asycmd.append('speedup=false')
-
-        asycmd.append("-u")
-        asycmd.append('speedup=' + str(ncompare))
-
-        if datatype == "gflops":
-            asycmd.append("-u")
-            asycmd.append('ylabel="GFLOP/sec"')
-
-        if self.runs[0].theoMax != -1:
-            asycmd.append("-u")
-            asycmd.append('theoMax=' + str(self.runs[0].theoMax))
-
-        asycmd.append("-u")
-        asycmd.append('xlabel='+'"Size: ' + getXLabel(self.runs[0])+'"')
-
-        asycmd.append("-o")
-        asycmd.append(self.filename(outdir, docformat) )
-
-        print(" ".join(asycmd))
-
-        return asycmd
-
-    def executeasy(self, outdir, docformat, datatype, ncompare):
-        asyproc =  subprocess.Popen(self.asycmd(outdir, docformat, datatype, ncompare),
-                                    env=os.environ.copy())
-        asyproc.wait()
-        asyrc = asyproc.returncode
-        if asyrc != 0:
-            print("****asy fail****")
-        return asyrc
-
-def getLabel(test):
-    if test['function']=='gemm':
-        return 'transA ' + test['transA']+ ' transB ' + test['transB']
-    elif  test['function']=='axpy':
-        return 'alpha '+str(test['alpha'])+' incx '+str(test['incx'])+' incy '+str(test['incy'])
-    elif  test['function']=='gemv':
-        return 'transA ' + test['transA']+' incx '+str(test['incx'])+' incy '+str(test['incy'])
-    elif test['function'] in ['dot', 'copy', 'swap']:
-        return 'incx '+str(test['incx'])+' incy '+str(test['incy'])
-    elif test['function'] in ['asum', 'nrm2', 'scal']:
-        return 'incx '+str(test['incx'])
-    elif test['function']=='trsm':
-        if test['side']=='R':
-            return 'N/lda '+str(test['N'])+' alpha '+ str(test['alpha']) + ' side ' + str(test['side']) + ' uplo ' + str(test['uplo']) + ' transA ' + test['transA'] + ' diag ' + str(test['diag'])
-        else:
-            return 'M/lda/ldb '+str(test['M'])+' alpha '+ str(test['alpha']) + ' side ' + str(test['side']) + ' uplo ' + str(test['uplo']) + ' transA ' + test['transA'] + ' diag ' + str(test['diag'])
-    else:
-        print('Legend label not defined for '+test['function'])
-        sys.exit(1)
-
-def getXLabel(test):
-    if test.function=='gemm':
-        return 'M=N=K=lda=ldb=ldc'
-    elif  test.function in ['axpy', 'asum', 'dot', 'copy', 'nrm2', 'scal', 'swap']:
-        return 'N'
-    elif  test.function=='gemv':
-        return 'M=N=lda'
-    elif  test.function=='trsm':
-        if test.side == 'R':
-            return 'M=ldb'
-        else:
-            return 'N'
-    else:
-        print('Xlabel not defined for ' + test.function)
-        sys.exit(1)
-
-def getFunctionPreFix(computeType):
-    if "32_r" in computeType:
-        return "s"
-    elif "64_r" in computeType:
-        return "d"
-    elif "32_c" in computeType:
-        return "c"
-    elif "64_c" in computeType:
-        return "z"
-    elif "bf16_r" in computeType:
-        return "bf"
-    elif "f16_r" in computeType:
-        return "h"
-    else:
-        print("Error - Cannot detect precision preFix: "+computeType)
-
-def getDeviceSpecs(device, sclk):
-    hwinfo = {}
-    hwinfo["theoMaxCompute"] = -1
-    hwinfo["sclk"] = int(sclk.split('M')[0])
-    # print(hwinfo["sclk"])
-    # print(hwinfo["sclk"]/1000.00 * 64 * 128)
-    if 'Vega 20' in device:
-        hwinfo["theoMaxCompute"] = hwinfo["sclk"]/1000.00 * 64 * 128 # 64 CU, 128 ops/ clk
-        hwinfo["Bandwidth"] = 1000
-        hwinfo["Device"] = 'Vega 20'
-    elif 'Vega 10' in device:
-        hwinfo["theoMaxCompute"] = hwinfo["sclk"]/1000.00 * 60 * 128
-        hwinfo["Bandwidth"] = 484
-        hwinfo["Device"] = 'Vega 10'
-    else:
-        print("Device type not supported or found - needed to display theoretical max")
-
-    return hwinfo
-
-
-def main(argv):
-    dirA = "."
-    dirB = None
-    dryrun = False
-    inputYaml = ""
-    outdir = "."
-    baseOutDir = "."
-    speedup = False
-    datatype = "gflops"
-    # shortrun = False
-    docformat = "pdf"
-    devicenum = 0
-    doAsy = False
-    nsample = 10
-
-    try:
-        opts, args = getopt.getopt(argv,"hA:f:B:Tt:a:b:o:S:sg:d:N:i:")
-    except getopt.GetoptError:
-        print("error in parsing arguments.")
-        print(usage)
-        sys.exit(2)
-    for opt, arg in opts:
-        if opt in ("-h"):
-            print(usage)
-            exit(0)
-        elif opt in ("-A"):
-            dirA = arg
-        elif opt in ("-B"):
-            dirB = arg
-        elif opt in ("-i"):
-            inputYaml = arg
-        elif opt in ("-o"):
-            outdir = arg
-        elif opt in ("-b"):
-            baseOutDir = arg
-        elif opt in ("-T"):
-            dryrun = True
-        # elif opt in ("-s"):
-        #     shortrun = True
-        elif opt in ("-g"):
-            if int(arg) == 0:
-                doAsy = False
-            if int(arg) == 1:
-                doAsy = True
-        elif opt in ("-d"):
-            devicenum = int(arg)
-        elif opt in ("-N"):
-            nsample = int(arg)
-        elif opt in ("-S"):
-            if int(arg) == 0:
-                speedup = False
-            if int(arg) == 1:
-                speedup = True
-        elif opt in ("-t"):
-            if arg not in ["time", "gflops"]:
-                print("data type must be time or gflops")
-                print(usage)
-                sys.exit(1)
-            datatype = arg
-        elif opt in ("-f"):
-            goodvals = ["pdf", "docx"]
-            if arg not in goodvals:
-                print("error: format must in " + " ".join(goodvals))
-                print(usage)
-                sys.exit(1)
-            docformat = arg
-
-    if os.path.isfile(inputYaml)==False:
-        print("unable to find input yaml file: " + inputYaml)
-        sys.exit(1)
-
-    print("dirA: "+ dirA)
-
-    if not dryrun and not binaryisok(dirA, "rocblas-bench"):
-        print("unable to find " + "rocblas-bench" + " in " + dirA)
-        print("please specify with -A")
-        sys.exit(1)
-
-    dirlist = [[dirA, outdir]]
-    if not dirB == None:
-        print("dirB: "+ dirB)
-
-        if not dryrun and not binaryisok(dirB, "rocblas-bench"):
-            print("unable to find " + "rocblas-bench" + " in " + dirB)
-            print("please specify with -B")
-            sys.exit(1)
-
-        if not os.path.exists(baseOutDir):
-            os.makedirs(baseOutDir)
-
-        dirlist.append([dirB, baseOutDir])
-
-    elif dryrun:
-        dirlist.append([dirB, baseOutDir])
-
-    print("outdir: " + outdir)
-    # if shortrun:
-    #     print("short run")
-    print("output format: " + docformat)
-    print("device number: " + str(devicenum))
-
-    if not os.path.exists(outdir):
-        os.makedirs(outdir)
-
-    rocBlasVersion = getVersion(dirA)
-    sclk = getspecs.getsclk(devicenum)
-    device = getspecs.getdeviceinfo(devicenum)
-
-    if not dryrun:
-        specs = "Host info:\n"
-        specs += "\thostname: " + getspecs.gethostname() + "\n"
-        specs += "\tcpu info: " + getspecs.getcpu() + "\n"
-        specs += "\tram: " + getspecs.getram() + "\n"
-        specs += "\tdistro: " + getspecs.getdistro() + "\n"
-        specs += "\tkernel version: " + getspecs.getkernel() + "\n"
-        specs += "\trocm version: " + getspecs.getrocmversion() + "\n"
-        specs += "\t" + rocBlasVersion.version + "\n"
-        specs += "Device info:\n"
-        specs += "\tdevice: " + device + "\n"
-        specs += "\tvbios version: " + getspecs.getvbios(devicenum) + "\n"
-        specs += "\tvram: " + getspecs.getvram(devicenum) + "\n"
-        specs += "\tperformance level: " + getspecs.getperflevel(devicenum) + "\n"
-        specs += "\tsystem clock: " + sclk + "\n"
-        specs += "\tmemory clock: " + getspecs.getmclk(devicenum) + "\n"
-
-        with open(os.path.join(outdir, "specs.txt"), "w+") as f:
-            f.write(specs)
-
-    hwinfo = getDeviceSpecs(device, sclk)
-
-    figs = []
+    command_runner.setup_system()
 
     #load yaml then create fig for every test
-    f = open(inputYaml, 'r')
-    data = yamldata(f)
-    f.close()
+    with open(user_args.input_yaml, 'r') as f:
+        data = YamlData(f)
+        f.close()
 
-    #setup tests sorted by their respectice figures
-    for tests in data.testcases:
-        name = getFunctionPreFix(tests[0]['compute_type']) + tests[0]['function'].split('_')[0] + " Performance"
-        fig = figure(name , name.replace('_', '\_'))
-        for test in tests:
-            for idx, lwdir in enumerate(dirlist):
-                wdir = lwdir[0]
-                odir = lwdir[1]
-                label = getLabel(test)
-                fig.runs.append( rundata(wdir, odir, idx, label,
-                                            test, hwinfo) )
-        figs.append(fig)
+    def get_function_prefix(compute_type):
+        if '32_r' in compute_type:
+            return 's'
+        elif '64_r' in compute_type:
+            return 'd'
+        elif '32_c' in compute_type:
+            return 'c'
+        elif '64_c' in compute_type:
+            return 'z'
+        elif 'bf16_r' in compute_type:
+            return 'bf'
+        elif 'f16_r' in compute_type:
+            return 'h'
+        else:
+            print('Error - Cannot detect precision preFix: ' + compute_type)
 
-    #print and launch blas functions
-    for fig in figs:
-        print(fig.name)
-        for run in fig.runs:
-            if not dryrun:
-                print(" ".join(run.runcmd(nsample)))
-                run.executerun(nsample)
+    comparisons = []
 
-    #generate plots
-    if doAsy:
-        print("")
-        for fig in figs:
-            ncompare = len(dirlist) if speedup else 0
-            print(fig.labels())
-            print(fig.asycmd(outdir, docformat, datatype, ncompare))
-            fig.executeasy(outdir, docformat, datatype, ncompare)
+    #setup tests sorted by their respective figures
+    for tests in data.test_cases:
+        name = get_function_prefix(tests[0]['compute_type']) + tests[0]['function'].split('_')[0] + ' Performance'
+        for data_type in user_args.data_types:
+            data_type_cls = data_type_classes[data_type]
+            comparison = data_type_cls(description=name)
+            for test in tests:
+                comparison.add( RocBlasArgumentSet(**{key:USED_YAML_KEYS_FMT[key](test[key]) for key in test if key in USED_YAML_KEYS_FMT}) )
+            comparisons.append(comparison)
 
-        if docformat == "pdf":
-            maketex(figs, outdir, nsample)
-        if docformat == "docx":
-            makedocx(figs, outdir, nsample)
+    command_runner.add_comparisons(comparisons)
 
-def binaryisok(dirname, progname):
-    prog = os.path.join(dirname, progname)
-    return os.path.isfile(prog)
+    command_runner.execute()
 
-def maketex(figs, outdir, nsample):
-
-    header = '''\documentclass[12pt]{article}
-\\usepackage{graphicx}
-\\usepackage{url}
-\\author{Wasiq Mahmood}
-\\begin{document}
-'''
-    texstring = header
-
-    texstring += "\n\\section{Introduction}\n"
-
-    texstring += "Each data point represents the median of " + str(nsample) + " values, with error bars showing the 95\\% confidence interval for the median.\n\n"
-    #TODO change message
-    # texstring += "The following figures display the performance of the user specified rocBLAS functions \n\n"
-
-
-
-    texstring += "\\vspace{1cm}\n"
-
-    # texstring += "\\begin{tabular}{ll}"
-    # texstring += labelA +" &\\url{"+ dirA+"} \\\\\n"
-    # if not dirB == None:
-    #     texstring += labelB +" &\\url{"+ dirB+"} \\\\\n"
-    # texstring += "\\end{tabular}\n\n"
-
-    # texstring += "\\vspace{1cm}\n"
-
-    specfilename = os.path.join(outdir, "specs.txt")
-    if os.path.isfile(specfilename):
-        specs = ""
-        with open(specfilename, "r") as f:
-            specs = f.read()
-
-        for line in specs.split("\n"):
-            if line.startswith("Host info"):
-                texstring += "\\noindent " + line
-                texstring += "\\begin{itemize}\n"
-            elif line.startswith("Device info"):
-                texstring += "\\end{itemize}\n"
-                texstring += line
-                texstring += "\\begin{itemize}\n"
-            else:
-                if line.strip() != "":
-                    texstring += "\\item " + line + "\n"
-        texstring += "\\end{itemize}\n"
-        texstring += "\n"
-
-    texstring += "\\clearpage\n"
-
-    texstring += "\n\\section{Figures}\n"
-
-    for fig in figs:
-        print(fig.filename(outdir, "pdf"))
-        print(fig.caption)
-        texstring += '''
-\\centering
-\\begin{figure}[htbp]
-   \\includegraphics[width=\\textwidth]{'''
-        texstring += fig.filename("", "pdf")
-        texstring += '''}
-   \\caption{''' + fig.caption + '''}
-\\end{figure}
-'''
-
-    texstring += "\n\\end{document}\n"
-
-    fname = os.path.join(outdir, 'figs.tex')
-
-    with open(fname, 'w') as outfile:
-        outfile.write(texstring)
-
-    fout = open(os.path.join(outdir, "texcmd.log"), 'w+')
-    ferr = open(os.path.join(outdir, "texcmd.err"), 'w+')
-
-    latexcmd = ["latexmk", "-pdf", 'figs.tex']
-    print(" ".join(latexcmd))
-    texproc =  subprocess.Popen(latexcmd, cwd=outdir, stdout=fout, stderr=ferr,
-                                env=os.environ.copy())
-    texproc.wait()
-    fout.close()
-    ferr.close()
-    texrc = texproc.returncode
-    if texrc != 0:
-        print("****tex fail****")
-
-def pdf2emf(pdfname):
-    svgname = pdfname.replace(".pdf",".svg")
-    cmd_pdf2svg = ["pdf2svg", pdfname, svgname]
-    proc = subprocess.Popen(cmd_pdf2svg, env=os.environ.copy())
-    proc.wait()
-    if proc.returncode != 0:
-        print("pdf2svg failed!")
-        sys.exit(1)
-
-    emfname = pdfname.replace(".pdf",".emf")
-    cmd_svg2emf = ["inkscape", svgname, "-M", emfname]
-    proc = subprocess.Popen(cmd_svg2emf, env=os.environ.copy())
-    proc.wait()
-    if proc.returncode != 0:
-        print("svg2emf failed!")
-        sys.exit(1)
-
-    return emfname
-
-def makedocx(figs, outdir, nsample):
-    import docx
-
-    document = docx.Document()
-
-    document.add_heading('rocBLAS benchmarks', 0)
-
-    document.add_paragraph("Each data point represents the median of " + str(nsample) + " values, with error bars showing the 95% confidence interval for the median.")
-
-    specfilename = os.path.join(outdir, "specs.txt")
-    if os.path.isfile(specfilename):
-        with open(specfilename, "r") as f:
-            specs = f.read()
-        for line in specs.split("\n"):
-            document.add_paragraph(line)
-
-    for fig in figs:
-        print(fig.filename(outdir, "docx"))
-        print(fig.caption)
-        emfname = pdf2emf(fig.filename(outdir, "docx"))
-        # NB: emf support does not work; adding the filename as a placeholder
-        # document.add_paragraph(emfname)
-        document.add_picture(emfname, width=docx.shared.Inches(6))
-        document.add_paragraph((fig.caption).replace('\\', ''))
-
-    document.save(os.path.join(outdir,'figs.docx'))
-
-if __name__ == "__main__":
-    main(sys.argv[1:])
-
+    command_runner.show_plots()
+    command_runner.output_summary()
