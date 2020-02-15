@@ -171,7 +171,7 @@ def main():
     parser.add_argument(      '--LDB',            required=False, default = 1, type=int)
     parser.add_argument(      '--LDC',            required=False, default = 1, type=int)
     parser.add_argument(      '--initialization', required=False, default = '')
-    parser.add_argument('-x', '--step_mult',      required=False, default = 0, type=int)
+    parser.add_argument('-x', '--step_mult',      required=False, default = False, action='store_true')
     parser.add_argument(      '--side',           required=False, default = 'L')
     parser.add_argument(      '--uplo',           required=False, default = 'L')
     parser.add_argument(      '--diag',           required=False, default = 'N')
@@ -209,7 +209,7 @@ def main():
     LDB            = user_args.LDB
     LDC            = user_args.LDC
     initialization = user_args.initialization
-    step_mult      = user_args.step_mult
+    step_mult      = 1 if user_args.step_mult else 0
     side           = user_args.side
     uplo           = user_args.uplo
     diag           = user_args.diag

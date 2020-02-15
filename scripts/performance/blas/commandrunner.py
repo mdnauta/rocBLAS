@@ -118,6 +118,17 @@ class RequiredArgument(ArgumentABC):
             raise RuntimeError('No value set for {}'.format(self.flag))
         return [self.flag, str(self._value)]
 
+class DefaultArgument(ArgumentABC):
+    def __init__(self, flag, default):
+        ArgumentABC.__init__(self)
+        self.flag = flag
+        self.default = default
+
+    def get_args(self):
+        if self._value is None:
+            return [self.flag, str(self.default)]
+        return [self.flag, str(self._value)]
+
 class RepeatedArgument(ArgumentABC):
     def __init__(self, flag):
         ArgumentABC.__init__(self)
@@ -310,7 +321,8 @@ class ArgumentSetABC(object):
     def execute(self,
                 run_configuration = None,
                 run_configurations = None,
-                overwrite = True):
+                overwrite = True,
+                dry_run = False):
         if self.combine_executables and (run_configurations is None or run_configuration is not None):
             raise ValueError('A list of run configurations must be passed in when using combined executables!')
         if not self.combine_executables and (run_configuration is None or run_configurations is not None):
@@ -325,43 +337,46 @@ class ArgumentSetABC(object):
             run_configurations = [run_configuration]
 
         execution_info = ExecutionInfo(filename = self._get_exec_info_filename(run_configuration))
-        old_return_code = execution_info.get_return_code()
+        old_return_code = execution_info.get_return_code() if not dry_run else None
         if old_return_code is not None and not overwrite:
             message = '{0} Using existing result with code {1} {0}'.format('=' * 10, old_return_code)
             return_code = old_return_code
         else:
-            stdout_file = open(self._get_stdout_filename(run_configuration), mode='w')
-            stderr_file = open(self._get_stderr_filename(run_configuration), mode='w')
-
             cmd = self.get_interleaved_command(run_configurations) if self.combine_executables else self.get_full_command(run_configuration)
-            # Log some information about the time and command being executed
             cmd_str = ' '.join(cmd)
-            time_str = str(datetime.datetime.now())
-            for out_file in [stdout_file, stderr_file]:
-                out_file.write('{0} {1} {0}\n'.format('=' * 10, time_str))
-                out_file.write(cmd_str + '\n')
-                out_file.flush()
             print(cmd_str)
 
-            is_shell_only = self.is_shell_only()
-            if is_shell_only:
-                cmd = cmd_str
-            proc = subprocess.Popen(cmd, stdout=stdout_file, stderr=stderr_file,
-                                    env=os.environ.copy(), shell=is_shell_only)
-            proc.wait()
-            return_code = proc.returncode
-            execution_info.set_return_code(return_code)
-            execution_info.save()
-            message = '{0} Completed with code {1} {0}'.format('=' * 10, return_code)
+            if dry_run:
+                return_code = 0
+            else:
+                stdout_file = open(self._get_stdout_filename(run_configuration), mode='w')
+                stderr_file = open(self._get_stderr_filename(run_configuration), mode='w')
+                # Log some information about the time and command being executed
+                time_str = str(datetime.datetime.now())
+                for out_file in [stdout_file, stderr_file]:
+                    out_file.write('{0} {1} {0}\n'.format('=' * 10, time_str))
+                    out_file.write(cmd_str + '\n')
+                    out_file.flush()
 
-            for out_file in [stdout_file, stderr_file]:
-                out_file.write(message + '\n')
-                out_file.flush()
+                is_shell_only = self.is_shell_only()
+                if is_shell_only:
+                    cmd = cmd_str
+                proc = subprocess.Popen(cmd, stdout=stdout_file, stderr=stderr_file,
+                                        env=os.environ.copy(), shell=is_shell_only)
+                proc.wait()
+                return_code = proc.returncode
+                execution_info.set_return_code(return_code)
+                execution_info.save()
+                message = '{0} Completed with code {1} {0}'.format('=' * 10, return_code)
 
-            # Copy output files for each run configuration that is not the first.
-            for added_run_configuration in run_configurations[1:]:
-                for filename_fn in [self._get_stdout_filename, self._get_stderr_filename, self._get_exec_info_filename]:
-                    shutil.copyfile(filename_fn(run_configuration), filename_fn(added_run_configuration))
+                for out_file in [stdout_file, stderr_file]:
+                    out_file.write(message + '\n')
+                    out_file.flush()
+
+                # Copy output files for each run configuration that is not the first.
+                for added_run_configuration in run_configurations[1:]:
+                    for filename_fn in [self._get_stdout_filename, self._get_stderr_filename, self._get_exec_info_filename]:
+                        shutil.copyfile(filename_fn(run_configuration), filename_fn(added_run_configuration))
 
         if return_code != 0 or old_return_code is not None:
             print(message)
@@ -929,6 +944,12 @@ class CommandRunner(object):
     def is_run_tool(self):
         return 'EXECUTE' in self.user_args.methods
 
+    def is_dry_run(self):
+        is_dry_run = ('DRY' in self.user_args.methods)
+        if self.is_run_tool() and is_dry_run:
+            raise ValueError('DRY and EXECUTE are mutually exclusive. Both were specified.')
+        return is_dry_run
+
     def is_make_plots(self):
         return 'PLOT' in self.user_args.methods
 
@@ -976,7 +997,7 @@ class CommandRunner(object):
             if self.is_run_tool():
                 run_configuration.make_output_directory()
                 run_configuration.save_specifications(self.user_args.device_num)
-            else:
+            elif not self.is_dry_run():
                 run_configuration.assert_exists()
 
 
@@ -1011,10 +1032,12 @@ class CommandRunner(object):
             if self._filter_argument_set(argument_set):
                 command_list.add_command(argument_set, self.run_configurations)
         self.command_list = command_list
-        if self.is_run_tool():
-            command_list.execute_shuffled(overwrite = self.is_overwrite())
+        if self.is_run_tool() or self.is_dry_run():
+            command_list.execute_shuffled(overwrite = self.is_overwrite(), dry_run = self.is_dry_run())
 
     def show_plots(self):
+        if self.is_dry_run():
+            return
         grouped_run_configurations = self.run_configurations.group_by_label()
         for group_label, run_configuration_group in grouped_run_configurations.items():
             run_configuration = run_configuration_group[0]
@@ -1112,8 +1135,8 @@ def parse_input_arguments(parser):
             raise argparse.ArgumentTypeError('Method must be one of {}. Received {}.'.format(choices, rv))
         return rv
 
-    all_test_methods     = ['EXECUTE', 'OVERWRITE', 'PROCESS', 'PLOT', 'DOCUMENT', 'INTERACTIVE']
-    default_test_methods = ['EXECUTE', 'OVERWRITE', 'PROCESS', 'PLOT', 'DOCUMENT']
+    all_test_methods     = ['DRY', 'EXECUTE', 'OVERWRITE', 'PROCESS', 'PLOT', 'DOCUMENT', 'INTERACTIVE']
+    default_test_methods = [       'EXECUTE', 'OVERWRITE', 'PROCESS', 'PLOT', 'DOCUMENT']
     def to_test_methods(s):
         return to_multiple_choices(all_test_methods, s)
 
@@ -1136,6 +1159,7 @@ def parse_input_arguments(parser):
                              +' To generate a document without re-running the benchmarks, use `-m PLOT DOCUMENT`.'
                              +' To run without plotting/documentation tools use `-m EXECUTE` and post-process later.'
                              +' To generate plots without creating a summary document use `-m EXECUTE PLOT`.'
+                             +' To print commands without running them use `-m DRY`.'
                              +' To interact with plots after generating the data use `-m PLOT INTERACTIVE`.'
                              +' By default, existing results are overwritten, but `-m EXECUTE PLOT DOCUMENT` can be used to restart killed runs (omit `OVERWRITE`).'
                              ))
