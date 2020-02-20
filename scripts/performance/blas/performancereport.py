@@ -252,6 +252,10 @@ class YamlData:
         self.import_data()
         self.reorder_data()
 
+<<<<<<< HEAD
+
+=======
+>>>>>>> aa66df8983153d91c1890c4b1b3fbbdabff9c16e
 class RocBlasYamlComparison(cr.Comparison):
     def __init__(self, test_yaml, data_type, **kwargs):
         def get_function_prefix(compute_type):
@@ -352,8 +356,4 @@ if __name__ == '__main__':
             comparisons.append(comparison)
 
     command_runner.add_comparisons(comparisons)
-
-    command_runner.execute()
-
-    command_runner.show_plots()
-    command_runner.output_summary()
+    command_runner.main()

@@ -51,6 +51,7 @@ import shutil
 import string
 import subprocess
 import sys
+import time
 
 import getspecs
 
@@ -65,6 +66,12 @@ try:
 except ImportError:
     np = None
 try:
+    import pandas as pd
+    if plt is not None:
+        pd.plotting.register_matplotlib_converters()
+except ImportError:
+    pd = None
+try:
     import pylatex
 except ImportError:
     pylatex = None
@@ -76,6 +83,105 @@ try:
     from io import BytesIO
 except ImportError:
     BytesIO = None
+
+# Install dependent modules
+smi = None
+smi_imported = False
+def import_rocm_smi(install_path):
+    global smi
+    global smi_imported
+    if not smi_imported:
+        smi_imported = True
+        try:
+            sys.path.append(os.path.join(install_path, 'bin'))
+            import rocm_smi
+            smi = rocm_smi
+        except ImportError:
+            print('WARNING - rocm_smi.py not found!')
+    return smi
+
+class SystemMonitor(object):
+    supported_metrics = [
+            'used_memory_percent',
+            'fclk_megahertz',
+            'mclk_megahertz',
+            'sclk_megahertz',
+            'socclk_megahertz',
+            'dcefclk_megahertz',
+            'fan_speed_percent',
+            ]
+    def __init__(self, metrics = supported_metrics):
+        if not smi_imported:
+            raise RuntimeError('import_rocm_smi(install_path) must be called before consturcting a SystemMonitor')
+        if len(metrics) == 0:
+            raise ValueError('SystemMonitor must record at least one metric')
+        self.metrics = metrics
+        self.data = {metric:{} for metric in self.metrics}
+
+    def record_line(self):
+        now = datetime.datetime.now()
+        for metric in self.metrics:
+            self.data[metric][now] = self.measure(metric)
+
+    def measure(self, metric, device=None):
+        if device is None:
+            device = smi.listDevices(showall=False)[0]
+        if smi is None:
+            return 0.0
+        elif metric == 'fan_speed_percent':
+            return smi.getFanSpeed(device)[1]
+        elif metric.find('clk') >=0 and metric.split('_')[0] in smi.validClockNames:
+            return int(smi.getCurrentClock(device, metric.split('_')[0], 'freq').strip('Mhz'))
+        elif 'used_memory_percent':
+            used_bytes, total_bytes = smi.getMemInfo(device, 'vram')
+            return int(used_bytes)*100.0/int(total_bytes)
+        else:
+            raise ValueError('Unrecognized metric requested: {}'.format(metric))
+
+    def save(self, info_filename):
+        with open(info_filename, 'w') as output_file:
+            output_file.write('# Time, {}\n'.format(', '.join(self.metrics)))
+            for time_measurement in sorted(self.data[self.metrics[0]].keys()):
+                output_file.write('{}, {}\n'.format(str(time_measurement),
+                        ', '.join(str(self.data[metric][time_measurement]) for metric in self.metrics)))
+            output_file.close()
+
+    @classmethod
+    def from_file(cls, info_filename):
+        if pd is None:
+            print('WARNING - pandas is required for background system monitor')
+            return None
+        rv = cls()
+        rv.data = pd.read_csv(info_filename, index_col=0, squeeze=True, parse_dates=True).to_dict()
+        rv.metrics = [key for key in rv.data.keys()]
+        return rv
+
+    def extend(self, other):
+        if self.metrics != other.metrics:
+            raise ValueError('Both SystemMonitors must have the same record metrics')
+        for metric in self.metrics:
+            for time_measurement, value in other.data[metric].items():
+                self.data[metric][time_measurement] = value
+
+    def get_times(self):
+        return self.data[self.metrics[0]].keys()
+
+    def get_start_time(self):
+        return min(self.get_times())
+
+    def get_end_time(self):
+        return max(self.get_times())
+
+    def plot(self):
+        if plt is not None:
+            figure, axes = plt.subplots(len(self.metrics), 1, sharex=True, squeeze=False)
+            for ax_idx, metric in enumerate(self.metrics):
+                ax = axes[ax_idx, 0]
+                x_values = sorted(self.data[metric].keys())
+                y_values = [self.data[metric][x] for x in x_values]
+                ax.plot(x_values, y_values, '.')
+                ax.set_ylabel(metric, rotation=0)
+            plt.show()
 
 class ArgumentABC(object):
     def __init__(self):
@@ -317,6 +423,14 @@ class ArgumentSetABC(object):
     def _get_exec_info_filename(self, run_configuration):
             basename = os.path.splitext(self.get_output_basename())[0]
             return os.path.abspath(os.path.join(run_configuration.output_directory, basename + '.json'))
+    def _get_system_monitor_filename(self, run_configuration):
+            basename = os.path.splitext(self.get_output_basename())[0]
+            return os.path.abspath(os.path.join(run_configuration.output_directory, basename + '.info'))
+
+    def get_system_monitor(self, run_configuration):
+        import_rocm_smi(self.user_args.install_path)
+        info_filename = self._get_system_monitor_filename(run_configuration)
+        return SystemMonitor.from_file(info_filename) if os.path.exists(info_filename) else None
 
     def execute(self,
                 run_configuration = None,
@@ -358,15 +472,31 @@ class ArgumentSetABC(object):
                     out_file.write(cmd_str + '\n')
                     out_file.flush()
 
+                import_rocm_smi(self.user_args.install_path)
+                system_monitor = SystemMonitor()
+
                 is_shell_only = self.is_shell_only()
                 if is_shell_only:
                     cmd = cmd_str
                 proc = subprocess.Popen(cmd, stdout=stdout_file, stderr=stderr_file,
                                         env=os.environ.copy(), shell=is_shell_only)
-                proc.wait()
-                return_code = proc.returncode
+                # Monitor system metrics while the process executes
+                poll_metric_count = 0
+                try:
+                    while proc.poll() is None:
+                        if smi is not None and poll_metric_count % 20 == 0:
+                            system_monitor.record_line()
+                        time.sleep(0.01)
+                        poll_metric_count += 1
+                except Exception as e:
+                    proc.kill()
+                    raise(e)
+
+                # Process has completed, collect the return code
+                return_code = proc.poll() # return code of process
                 execution_info.set_return_code(return_code)
                 execution_info.save()
+                system_monitor.save(self._get_system_monitor_filename(run_configuration))
                 message = '{0} Completed with code {1} {0}'.format('=' * 10, return_code)
 
                 for out_file in [stdout_file, stderr_file]:
@@ -473,29 +603,26 @@ class MachineSpecs(dict):
             device_info['memory clock'] = getspecs.getmclk(device_num)
             rv['Device {0:2d}'.format(device_num)] = device_info
 
-        try:
-            sys.path.append(os.path.join(install_path, 'bin'))
-            import rocm_smi
-            devices = rocm_smi.listDevices(showall=False)
+        smi = import_rocm_smi(install_path)
+        if smi is not None:
+            devices = smi.listDevices(showall=False)
             for device in devices:
                 smi_info = {}
-                smi_info['Bus'] = rocm_smi.getBus(device)
-                smi_info['Profile'] = rocm_smi.getProfile(device)
-                smi_info['Start Fan Speed'] = str(rocm_smi.getFanSpeed(device)[1]) + '%'
-                for clock in rocm_smi.validClockNames:
-                    freq = rocm_smi.getCurrentClock(device, clock, 'freq')
-                    measured_level = rocm_smi.getCurrentClock(device, clock, 'level')
-                    max_level = rocm_smi.getMaxLevel(device, clock)
+                smi_info['Bus'] = smi.getBus(device)
+                smi_info['Profile'] = smi.getProfile(device)
+                smi_info['Start Fan Speed'] = str(smi.getFanSpeed(device)[1]) + '%'
+                for clock in smi.validClockNames:
+                    freq = smi.getCurrentClock(device, clock, 'freq')
+                    measured_level = smi.getCurrentClock(device, clock, 'level')
+                    max_level = smi.getMaxLevel(device, clock)
                     smi_info['Start ' + clock] = '{} - Level {}/{}'.format(freq, measured_level, max_level)
-                for mem_type in rocm_smi.validMemTypes:
+                for mem_type in smi.validMemTypes:
                     key = 'Start {} Memory'.format(mem_type)
-                    used_bytes, total_bytes = rocm_smi.getMemInfo(device, mem_type)
+                    used_bytes, total_bytes = smi.getMemInfo(device, mem_type)
                     smi_info[key] = '{} / {}'.format(to_mem_units(used_bytes), to_mem_units(total_bytes))
-                for component in rocm_smi.validVersionComponents:
-                    smi_info[component.capitalize() + ' Version'] = rocm_smi.getVersion([device], component)
+                for component in smi.validVersionComponents:
+                    smi_info[component.capitalize() + ' Version'] = smi.getVersion([device], component)
                 rv['ROCm ' + device.capitalize()] = smi_info
-        except ImportError:
-            print('WARNING - rocm_smi.py not found!')
 
         return rv
 
@@ -941,6 +1068,12 @@ class CommandRunner(object):
         if len(run_configuration_hashes) != len(set(run_configuration_hashes)):
             raise RuntimeError('Not all run configurations have a unique hash! Are the output directories unique?')
 
+    def main(self):
+        self.execute()
+        self.show_plots()
+        self.get_system_summary()
+        self.output_summary()
+
     def is_run_tool(self):
         return 'EXECUTE' in self.user_args.methods
 
@@ -1116,6 +1249,26 @@ class CommandRunner(object):
         if len(active_plots) > 0:
             plt.show()
 
+    def get_system_summary(self):
+        if not self.is_interactive():
+            return
+        total_system_monitor = None
+        for cmd_hash, argument_set in self.argument_set_map.items():
+            if self._filter_argument_set(argument_set):
+                for run_configuration in self.run_configurations:
+                    run_system_monitor = argument_set.get_system_monitor(run_configuration)
+                    if run_system_monitor is not None:
+                        if total_system_monitor is None:
+                            total_system_monitor = run_system_monitor
+                        else:
+                            total_system_monitor.extend(run_system_monitor)
+        if total_system_monitor is not None:
+            start = total_system_monitor.get_start_time()
+            end = total_system_monitor.get_end_time()
+            total_time = (end - start).total_seconds()
+            print('Test ran from {} to {}. A total of {} seconds.'.format(start, end, total_time))
+            total_system_monitor.plot()
+
     def output_summary(self):
         if self.is_use_pylatex():
             current_working_directory = os.getcwd()
@@ -1159,7 +1312,6 @@ def parse_input_arguments(parser):
                              +' To generate a document without re-running the benchmarks, use `-m PLOT DOCUMENT`.'
                              +' To run without plotting/documentation tools use `-m EXECUTE` and post-process later.'
                              +' To generate plots without creating a summary document use `-m EXECUTE PLOT`.'
-                             +' To print commands without running them use `-m DRY`.'
                              +' To interact with plots after generating the data use `-m PLOT INTERACTIVE`.'
                              +' By default, existing results are overwritten, but `-m EXECUTE PLOT DOCUMENT` can be used to restart killed runs (omit `OVERWRITE`).'
                              ))
@@ -1295,8 +1447,4 @@ if __name__ == '__main__':
 
     command_runner.add_comparisons(create_comparisons())
 
-    command_runner.execute()
-
-    # TODO: Add/extract timing information
-    command_runner.show_plots()
-    command_runner.output_summary()
+    command_runner.main()
